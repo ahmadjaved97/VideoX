@@ -96,8 +96,22 @@ def main(config):
     text_labels = generate_text(train_data)
     
     if config.TEST.ONLY_TEST:
+        print("Accuracy calculation-------")
+
         acc1 = validate(val_loader, text_labels, model, config)
-        logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+        logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1 * 100:.3f}%")
+
+        # After validation is done, save the extracted features
+        vision_features = torch.cat(model.extracted_vision_features, dim=0)  # Stack all vision features
+        text_features = model.extracted_text_features  # Already extracted
+
+        # Save as .pt files
+        torch.save(vision_features, "vision_features.pt")
+        torch.save(text_features, "text_features.pt")
+
+        print(f"Saved Vision Features: {vision_features.shape}")  # Should be (N, e)
+        print(f"Saved Text Features: {text_features.shape}")  # Should be (C, e)
+
         return
 
     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
@@ -118,7 +132,8 @@ def main(config):
     config.freeze()
     train_data, val_data, train_loader, val_loader = build_dataloader(logger, config)
     acc1 = validate(val_loader, text_labels, model, config)
-    logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+    logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1 * 100:.1f}%")
+    
 
 
 def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_loader, text_labels, config, mixup_fn):
@@ -215,34 +230,47 @@ def validate(val_loader, text_labels, model, config):
            
             tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
             for i in range(n):  
-                image = _image[:, i, :, :, :, :]  # Extracting a temporal clip
+                image = _image[:, i, :, :, :, :] 
                 image_input = image.cuda(non_blocking=True)
 
                 if config.TRAIN.OPT_LEVEL == 'O2':
                     image_input = image_input.half()
                 
                 output = model(image_input, text_inputs)
+                mean = output.mean(dim=1, keepdim=True)
+                std = output.std(dim=1, keepdim=True) + 1e-6  # Prevent divide by zero
+                standardized_logits = (output - mean) / std
+                # min_val = output.min()
+                # max_val = output.max()
 
-                # Apply sigmoid activation for multi-label classification
-                similarity = torch.sigmoid(output.view(b, -1)/10)
+                # # min-max normalization
+                # epsilon = 1e-8
+                # normalized_output = (output - min_val)/(max_val - min_val + epsilon)
+
+                # Apply sigmoid activation 
+                # similarity = torch.sigmoid(output.view(b, -1))
+                # similarity = output.view(b, -1)
+
+                similarity = torch.sigmoid(standardized_logits.view(b, -1))
+
 
                 # Aggregate across different temporal clips
                 tot_similarity += similarity
 
             tot_similarity = tot_similarity / n
-            # Store outputs and ground truth for mAP computation
+            # Store outputs and ground truth 
             all_outputs.append(tot_similarity.cpu().numpy())
             all_targets.append(label_id.cpu().numpy())  # Already multi-hot
 
             if idx % config.PRINT_FREQ == 0:
                 logger.info(f'Processed {idx}/{len(val_loader)} batches')
 
-    # Compute mean Average Precision (mAP)
+    #mean Average Precision
     all_outputs = np.vstack(all_outputs)
     all_targets = np.vstack(all_targets)
     
-    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)  # Per-class AP
-    mean_mAP = np.mean(mAP_per_class)  # Mean AP across all classes
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)  
+    mean_mAP = np.mean(mAP_per_class)  
 
     # Sync mAP across all GPUs
     mAP_meter.update(mean_mAP, n=1)
