@@ -77,6 +77,11 @@ class XCLIP(CLIP):
         self.cache_text_features = None
         self.prompts_visual_ln = LayerNorm(vision_width)
         self.prompts_visual_proj = nn.Parameter(torch.randn(vision_width, embed_dim))
+
+
+        # Store extracted features
+        self.extracted_vision_features = []  # Vision Features for all videos
+        self.extracted_text_features = None  # Text Features (same across batches)
         
         self.initialize_parameters()
     
@@ -136,15 +141,27 @@ class XCLIP(CLIP):
         else:
             text_features = self.encode_text(text)
         
+        if self.extracted_text_features is None:
+            self.extracted_text_features =   text_features.detach().cpu()  # Store only once
+        
         text_features = text_features.unsqueeze(0).expand(b, -1, -1)
         text_features = text_features + self.prompts_generator(text_features, img_features)
            
         video_features = video_features / video_features.norm(dim=-1, keepdim=True)
+
+        embed_dim = video_features.shape[-1]
+
+        
+        # Store vision features
+        self.extracted_vision_features.append(video_features.detach().cpu())
+        
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        
         logit_scale = self.logit_scale.exp()
         logits = torch.einsum("bd,bkd->bk", video_features, logit_scale * text_features)
         
-        return logits
+        return logits, video_features
 
 
 def build_model(state_dict: dict, T=8, droppath=0., use_checkpoint=False, logger=None, prompts_alpha=1e-1, prompts_layers=2, use_cache=True, mit_layers=4,):
