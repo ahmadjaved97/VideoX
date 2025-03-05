@@ -29,6 +29,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
 from mmcv.parallel import collate
 import pandas as pd
+from mmcv.parallel import collate as mmcv_collate
+
 
 PIPELINES = Registry('pipeline')
 img_norm_cfg = dict(
@@ -191,17 +193,20 @@ class VideoDataset(BaseDataset):
         video_infos = []
         with open(self.ann_file, 'r') as fin:
             for line in fin:
-                line_split = line.strip().split()
+                line_split = line.strip().split(',')
                 if self.multi_class:
                     assert self.num_classes is not None
-                    filename, label = line_split[0], line_split[1:]
+                    filename, label = line_split[0], line_split[1]
+                    label = label.split("|")
                     label = list(map(int, label))
                 else:
                     filename, label = line_split
                     label = int(label)
+                    
                 if self.data_prefix is not None:
                     filename = osp.join(self.data_prefix, filename)
                 video_infos.append(dict(filename=filename, label=label, tar=self.use_tar_format))
+
         return video_infos
 
 
@@ -225,20 +230,28 @@ class SubsetRandomSampler(torch.utils.data.Sampler):
     def set_epoch(self, epoch):
         self.epoch = epoch
 
+class SubsetSequentialSampler(torch.utils.data.Sampler):
+    def __init__(self, indices):
+        self.indices = indices
+    def __iter__(self):
+        return iter(self.indices)
+    def __len__(self):
+        return len(self.indices)
+    
 
-def mmcv_collate(batch, samples_per_gpu=1): 
-    if not isinstance(batch, Sequence):
-        raise TypeError(f'{batch.dtype} is not supported.')
-    if isinstance(batch[0], Sequence):
-        transposed = zip(*batch)
-        return [collate(samples, samples_per_gpu) for samples in transposed]
-    elif isinstance(batch[0], Mapping):
-        return {
-            key: mmcv_collate([d[key] for d in batch], samples_per_gpu)
-            for key in batch[0]
-        }
-    else:
-        return default_collate(batch)
+# def mmcv_collate(batch, samples_per_gpu=1): 
+#     if not isinstance(batch, Sequence):
+#         raise TypeError(f'{batch.dtype} is not supported.')
+#     if isinstance(batch[0], Sequence):
+#         transposed = zip(*batch)
+#         return [collate(samples, samples_per_gpu) for samples in transposed]
+#     elif isinstance(batch[0], Mapping):
+#         return {
+#             key: mmcv_collate([d[key] for d in batch], samples_per_gpu)
+#             for key in batch[0]
+#         }
+#     else:
+#         return default_collate(batch)
 
 
 def build_dataloader(logger, config):
@@ -267,7 +280,7 @@ def build_dataloader(logger, config):
         
     
     train_data = VideoDataset(ann_file=config.DATA.TRAIN_FILE, data_prefix=config.DATA.ROOT,
-                              labels_file=config.DATA.LABEL_LIST, pipeline=train_pipeline)
+                              labels_file=config.DATA.LABEL_LIST, pipeline=train_pipeline, multi_class=True, num_classes=config.DATA.NUM_CLASSES)
     num_tasks = dist.get_world_size()
     global_rank = dist.get_rank()
     sampler_train = torch.utils.data.DistributedSampler(
@@ -290,7 +303,7 @@ def build_dataloader(logger, config):
         dict(type='CenterCrop', crop_size=config.DATA.INPUT_SIZE),
         dict(type='Normalize', **img_norm_cfg),
         dict(type='FormatShape', input_format='NCHW'),
-        dict(type='Collect', keys=['imgs', 'label'], meta_keys=[]),
+        dict(type='Collect', keys=['imgs', 'label'], meta_keys=['filename']),
         dict(type='ToTensor', keys=['imgs'])
     ]
     if config.TEST.NUM_CROP == 3:
@@ -299,16 +312,20 @@ def build_dataloader(logger, config):
     if config.TEST.NUM_CLIP > 1:
         val_pipeline[1] = dict(type='SampleFrames', clip_len=1, frame_interval=1, num_clips=config.DATA.NUM_FRAMES, multiview=config.TEST.NUM_CLIP)
     
-    val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=config.DATA.ROOT, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline)
+    val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=config.DATA.ROOT, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline,
+                            multi_class=True, num_classes=config.DATA.NUM_CLASSES)
+
     indices = np.arange(dist.get_rank(), len(val_data), dist.get_world_size())
-    sampler_val = SubsetRandomSampler(indices)
+    # sampler_val = SubsetRandomSampler(indices)
+    sampler_val = SubsetSequentialSampler(indices)
+
     val_loader = DataLoader(
         val_data, sampler=sampler_val,
-        batch_size=2,
+        batch_size=1,
         num_workers=16,
         pin_memory=True,
-        drop_last=True,
-        collate_fn=partial(mmcv_collate, samples_per_gpu=2),
+        drop_last=False, #True,
+        collate_fn=partial(mmcv_collate, samples_per_gpu=1),
     )
 
     return train_data, val_data, train_loader, val_loader
