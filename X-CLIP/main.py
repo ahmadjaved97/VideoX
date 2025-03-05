@@ -20,6 +20,7 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from datasets.blending import CutmixMixupBlending
 from utils.config import get_config
 from models import xclip
+from sklearn.metrics import average_precision_score
 
 def parse_option():
     parser = argparse.ArgumentParser()
@@ -95,8 +96,25 @@ def main(config):
     text_labels = generate_text(train_data)
     
     if config.TEST.ONLY_TEST:
-        acc1 = validate(val_loader, text_labels, model, config)
-        logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+        print("Accuracy calculation-------")
+
+        filename = 'event'
+        logits_dir = './event_logits_dir_ov'
+        acc1 = validate(val_loader, text_labels, model, config, filename, logits_dir)
+        logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1 * 100:.5f}%")
+
+        mAP1 = validate_from_saved_logits2(val_loader, config, logits_dir, filename)
+        print('map from saved individual logits: ', mAP1)
+
+        full_lp = os.path.join('./', f'{filename}_logits.pth')
+        mAP2 = validate_from_saved_logits(val_loader, full_lp, config)
+        print('mAP from logits: ', mAP2)
+
+        text_features = model.module.extracted_text_features  # Already extracted
+
+        # Save text features
+        torch.save(text_features, f"{filename}_text_features.pt")
+
         return
 
     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
@@ -117,7 +135,8 @@ def main(config):
     config.freeze()
     train_data, val_data, train_loader, val_loader = build_dataloader(logger, config)
     acc1 = validate(val_loader, text_labels, model, config)
-    logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+    logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1 * 100:.1f}%")
+    
 
 
 def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_loader, text_labels, config, mixup_fn):
@@ -132,11 +151,11 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
     end = time.time()
     
     texts = text_labels.cuda(non_blocking=True)
-    
     for idx, batch_data in enumerate(train_loader):
 
         images = batch_data["imgs"].cuda(non_blocking=True)
-        label_id = batch_data["label"].cuda(non_blocking=True)
+        label_id = batch_data["label"].cuda(non_blocking=True).float()
+        
         label_id = label_id.reshape(-1)
         images = images.view((-1,config.DATA.NUM_FRAMES,3)+images.size()[-2:])
         
@@ -186,19 +205,23 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
-
 @torch.no_grad()
 def validate(val_loader, text_labels, model, config):
     model.eval()
     
-    acc1_meter, acc5_meter = AverageMeter(), AverageMeter()
+    all_targets = []
+    all_outputs = []
+
+    # Initialize mAP tracker
+    mAP_meter = AverageMeter()
+
     with torch.no_grad():
         text_inputs = text_labels.cuda()
         logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+        
         for idx, batch_data in enumerate(val_loader):
             _image = batch_data["imgs"]
-            label_id = batch_data["label"]
-            label_id = label_id.reshape(-1)
+            label_id = batch_data["label"].cuda(non_blocking=True).float()  # Already multi-hot formatted
 
             b, tn, c, h, w = _image.size()
             t = config.DATA.NUM_FRAMES
@@ -206,39 +229,454 @@ def validate(val_loader, text_labels, model, config):
             _image = _image.view(b, n, t, c, h, w)
            
             tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
-            for i in range(n):
-                image = _image[:, i, :, :, :, :] # [b,t,c,h,w]
-                label_id = label_id.cuda(non_blocking=True)
+            for i in range(n):  
+                image = _image[:, i, :, :, :, :] 
                 image_input = image.cuda(non_blocking=True)
 
                 if config.TRAIN.OPT_LEVEL == 'O2':
                     image_input = image_input.half()
                 
-                output = model(image_input, text_inputs)
-                
-                similarity = output.view(b, -1).softmax(dim=-1)
+                output, vid_feats = model(image_input, text_inputs)
+                mean = output.mean(dim=1, keepdim=True)
+                std = output.std(dim=1, keepdim=True) + 1e-6  # Prevent divide by zero
+                standardized_logits = (output - mean) / std
+
+                # Apply sigmoid activation 
+                # similarity = torch.sigmoid(output.view(b, -1))
+                similarity = output.view(b, -1)
+
+                # similarity = torch.sigmoid(standardized_logits.view(b, -1))
+
+
+                # Aggregate across different temporal clips
                 tot_similarity += similarity
 
-            values_1, indices_1 = tot_similarity.topk(1, dim=-1)
-            values_5, indices_5 = tot_similarity.topk(5, dim=-1)
-            acc1, acc5 = 0, 0
-            for i in range(b):
-                if indices_1[i] == label_id[i]:
-                    acc1 += 1
-                if label_id[i] in indices_5[i]:
-                    acc5 += 1
-           
-            acc1_meter.update(float(acc1) / b * 100, b)
-            acc5_meter.update(float(acc5) / b * 100, b)
+            tot_similarity = tot_similarity / n
+            # Store outputs and ground truth 
+            all_outputs.append(tot_similarity.cpu().numpy())
+            all_targets.append(label_id.cpu().numpy())  # Already multi-hot
+
             if idx % config.PRINT_FREQ == 0:
-                logger.info(
-                    f'Test: [{idx}/{len(val_loader)}]\t'
-                    f'Acc@1: {acc1_meter.avg:.3f}\t'
-                )
-    acc1_meter.sync()
-    acc5_meter.sync()
-    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
-    return acc1_meter.avg
+                logger.info(f'Processed {idx}/{len(val_loader)} batches')
+
+    #mean Average Precision
+    all_outputs = np.vstack(all_outputs)
+    all_targets = np.vstack(all_targets)
+    
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)  
+    mean_mAP = np.mean(mAP_per_class)  
+
+    # Sync mAP across all GPUs
+    mAP_meter.update(mean_mAP, n=1)
+    mAP_meter.sync()
+
+    logger.info(f" * Mean Average Precision (mAP): {mAP_meter.avg:.5f}")
+    return mAP_meter.avg
+
+@torch.no_grad()
+def validate(val_loader, text_labels, model, config, filename):
+    model.eval()
+    
+    all_targets = []
+    all_outputs = []
+
+
+    all_features = []  # Store features
+    all_logits = []    # Store logits
+    
+
+    mAP_meter = AverageMeter()
+    
+    import pdb
+    pdb.set_trace()
+        
+    with torch.no_grad():
+        text_inputs = text_labels.cuda()
+        logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+        
+        for idx, batch_data in enumerate(val_loader):
+            _image = batch_data["imgs"]
+            label_id = batch_data["label"].cuda(non_blocking=True).float()  # Already multi-hot formatted
+            
+            b, tn, c, h, w = _image.size()
+            t = config.DATA.NUM_FRAMES
+            n = tn // t
+            _image = _image.view(b, n, t, c, h, w)
+            
+            tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
+            
+            batch_features = []
+            batch_logits = []
+            # import pdb
+            # pdb.set_trace()
+
+            for i in range(n):
+                image = _image[:, i, :, :, :, :]
+                image_input = image.cuda(non_blocking=True)
+                
+                if config.TRAIN.OPT_LEVEL == 'O2':
+                    image_input = image_input.half()
+                
+                # logit, video_features
+                output, features = model(image_input, text_inputs)
+                
+                batch_features.append(features.cpu())
+                
+                batch_logits.append(output.cpu())
+                
+                mean = output.mean(dim=1, keepdim=True)
+                std = output.std(dim=1, keepdim=True) + 1e-6  # Prevent divide by zero
+                standardized_logits = (output - mean) / std
+                
+                similarity = output.view(b, -1)
+                
+
+                tot_similarity += similarity
+            
+            # Stack features and logits for this batch (b, n, embedding_size)
+            batch_features = torch.stack(batch_features, dim=1)  # Shape: (b, n, embedding_size)
+            batch_logits = torch.stack(batch_logits, dim=1)      # Shape: (b, n, num_classes)
+            
+            # Store features and logits
+            all_features.append(batch_features)
+            all_logits.append(batch_logits)
+            
+            # Normalize similarity by number of views
+            tot_similarity = tot_similarity / n
+            
+            # Store outputs and ground truth
+            all_outputs.append(tot_similarity.cpu().numpy())
+            all_targets.append(label_id.cpu().numpy())  # Already multi-hot
+            
+            if idx % config.PRINT_FREQ == 0:
+                logger.info(f'Processed {idx}/{len(val_loader)} batches')
+    
+    # Concatenate all features and logits across batches
+    all_features = torch.cat(all_features, dim=0)  # Shape: (num_instance, num_views, embedding_size)
+    all_logits = torch.cat(all_logits, dim=0)      # Shape: (num_instance, num_views, num_classes)
+    
+    # Save features and logits to file
+    features_path = os.path.join('./', f'{filename}_features.pth')
+    logits_path = os.path.join('./', f'{filename}_logits.pth')
+    
+    torch.save(all_features, features_path)
+    torch.save(all_logits, logits_path)
+    
+    logger.info(f"Saved features with shape {all_features.shape} to {features_path}")
+    logger.info(f"Saved logits with shape {all_logits.shape} to {logits_path}")
+    
+    # Mean Average Precision calculation
+    all_outputs = np.vstack(all_outputs)
+    all_targets = np.vstack(all_targets)
+    
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)
+    mean_mAP = np.mean(mAP_per_class)
+    
+    # Sync mAP across all GPUs
+    mAP_meter.update(mean_mAP, n=1)
+    mAP_meter.sync()
+    
+    logger.info(f" * Mean Average Precision (mAP): {mAP_meter.avg:.5f}")
+    return mAP_meter.avg
+
+def validate_from_saved_logits(val_loader, logits_path, config):
+    
+    print("========== Inside validation from whole logits ================")
+    # Initialize mAP tracker
+    mAP_meter = AverageMeter()
+    
+    # Load saved logits - shape: (num_instance, num_views, num_classes)
+    all_saved_logits = torch.load(logits_path)
+    logger.info(f"Loaded logits with shape {all_saved_logits.shape}")
+    
+    all_targets = []
+    all_outputs = []
+    
+    # Track current position in saved logits
+    logit_idx = 0
+    
+    for idx, batch_data in enumerate(val_loader):
+        label_id = batch_data["label"].cuda(non_blocking=True).float()  # Already multi-hot formatted
+        b = label_id.shape[0]
+        
+        # Extract logits for this batch
+        batch_logits = all_saved_logits[logit_idx:logit_idx + b]
+        logit_idx += b
+        
+        # Get number of views
+        n = batch_logits.shape[1]
+        
+        # Process logits for this batch
+        tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
+
+        for i in range(n):
+            # Get logits for this view
+            view_logits = batch_logits[:, i, :].cuda()
+            
+            # Apply the same processing as in the original validate function
+            similarity = view_logits.view(b, -1)
+            
+            tot_similarity += similarity
+        
+        tot_similarity = tot_similarity / n
+        
+        # Store outputs and ground truth
+        all_outputs.append(tot_similarity.cpu().numpy())
+        all_targets.append(label_id.cpu().numpy())  # Already multi-hot
+        
+        if idx % config.PRINT_FREQ == 0:
+            logger.info(f'Processed {idx}/{len(val_loader)} batches')
+    
+    # Mean Average Precision calculation
+    all_outputs = np.vstack(all_outputs)
+    all_targets = np.vstack(all_targets)
+    
+    logger.info(f"Final shapes: outputs {all_outputs.shape}, targets {all_targets.shape}")
+    
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)
+    mean_mAP = np.mean(mAP_per_class)
+    
+    mAP_meter.update(mean_mAP, n=1)
+    mAP_meter.sync()
+    
+    logger.info(f" * Mean Average Precision (mAP) from saved logits: {mAP_meter.avg:.5f}")
+    
+    return mAP_meter.avg
+
+
+@torch.no_grad()
+def validate(val_loader, text_labels, model, config, filename_prefix, logits_dir):
+    """
+    This validation function is used.
+    """
+    print("============ Inside validation function ================")
+    os.makedirs(logits_dir, exist_ok=True)
+    model.eval()
+    
+    # Prepare accumulators
+    all_targets = []
+    all_outputs = []
+
+    all_features = []
+    all_logits = []
+    
+    # AverageMeter for synchronization of mAP across GPUs
+    mAP_meter = AverageMeter()
+    
+    
+    # Move text embeddings to GPU
+    text_inputs = text_labels.cuda()
+    logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+
+    for idx, batch_data in enumerate(val_loader):
+    
+        img_metas = batch_data["img_metas"].data  # e.g., [[{'filename': 'path/to/video'}]]
+        video_name = img_metas[0][0]["filename"]
+        
+
+        _image = batch_data["imgs"]
+        label_id = batch_data["label"].cuda(non_blocking=True).float()  # Multi-hot format
+
+        b, tn, c, h, w = _image.size()
+        t = config.DATA.NUM_FRAMES
+        n = tn // t
+        _image = _image.view(b, n, t, c, h, w)
+
+        tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
+        
+        # Store per-batch (video) features/logits
+        batch_features = []
+        batch_logits = []
+
+        for i in range(n):
+            image_input = _image[:, i, :, :, :, :].cuda(non_blocking=True)
+            if config.TRAIN.OPT_LEVEL == 'O2':
+                image_input = image_input.half()
+
+            # logits, features
+            output, features = model(image_input, text_inputs)
+
+            # Collect features/logits on CPU
+            batch_features.append(features.cpu())
+            batch_logits.append(output.cpu())
+
+            
+            mean = output.mean(dim=1, keepdim=True)
+            std = output.std(dim=1, keepdim=True) + 1e-6
+            standardized_logits = (output - mean) / std  # Not used further, but kept for reference
+
+            # Accumulate similarity
+            similarity = output.view(b, -1)  # (b, num_classes)
+            tot_similarity += similarity
+
+        # Stack per-view features and logits: (b, n, embed_size or num_classes)
+        batch_features = torch.stack(batch_features, dim=1)
+        batch_logits = torch.stack(batch_logits, dim=1)
+
+        # Save per-video logits to an individual file (additional feature of 1st version)
+        # Save per-video logits to an individual file
+        video_basename = os.path.basename(video_name)
+        per_video_logits_path = os.path.join(logits_dir, f"{filename_prefix}_{video_basename}_logits.pth")
+        per_video_logits_npy = os.path.join(logits_dir, f"{filename_prefix}_{video_basename}_logits.npy")
+
+        torch.save(batch_logits, per_video_logits_path)
+        np.save(per_video_logits_npy, batch_logits.numpy())
+        # logger.info(f"Saved logits for video={video_name} to {per_video_logits_path}")
+
+        tot_similarity = tot_similarity / n
+
+        # Accumulate outputs and targets for final mAP
+        all_outputs.append(tot_similarity.cpu().numpy())
+        all_targets.append(label_id.cpu().numpy())
+
+        all_features.append(batch_features)
+        all_logits.append(batch_logits)
+
+        if idx % config.PRINT_FREQ == 0:
+            logger.info(f"Processed {idx}/{len(val_loader)} videos")
+
+   
+    # Concatenate features/logits across all videos
+    all_features = torch.cat(all_features, dim=0)  # (num_samples, num_views, embedding_size)
+    all_logits = torch.cat(all_logits, dim=0)      # (num_samples, num_views, num_classes)
+
+    # Final paths for concatenated features and logits
+    features_path = os.path.join('./', f'{filename_prefix}_features.pth')
+    total_logits_path = os.path.join('./', f'{filename_prefix}_logits.pth')
+
+    torch.save(all_features, features_path)
+    torch.save(all_logits, total_logits_path)
+
+    logger.info(f"Saved all features with shape {all_features.shape} to {features_path}")
+    logger.info(f"Saved all logits with shape {all_logits.shape} to {total_logits_path}")
+
+
+    all_outputs = np.vstack(all_outputs)  # (num_videos, num_classes)
+    all_targets = np.vstack(all_targets)  # (num_videos, num_classes)
+
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)
+    mean_mAP = np.mean(mAP_per_class)
+
+    # Sync mAP across GPUs
+    mAP_meter.update(mean_mAP, n=1)
+    mAP_meter.sync()
+
+    logger.info(f" * Mean Average Precision (mAP): {mAP_meter.avg:.5f}")
+
+    return mAP_meter.avg
+
+@torch.no_grad()
+def validate_from_saved_logits2(val_loader, config, logits_dir, filename_prefix):
+    """
+    Loads per-video logits (saved as individual files) and computes mAP.
+    """
+
+    print('===== Inside saved individual logits function =======')
+    all_outputs = []
+    all_targets = []
+
+    for idx, batch_data in enumerate(val_loader):
+        # 1) Extract label(s) and move them to CPU for final scoring
+        label_id = batch_data["label"].float().cpu().numpy().astype(np.float32)  # shape (b, num_classes)
+        b = label_id.shape[0]
+
+        # 2) Extract the video filename from img_metas
+        
+        img_metas = batch_data["img_metas"].data
+        video_name = img_metas[0][0]["filename"]
+        video_basename = os.path.basename(video_name)
+
+        # logits_path = os.path.join(
+        #     logits_dir, f"{filename_prefix}_{video_basename}_logits.pth"
+        # )
+        logits_path = os.path.join(logits_dir, f"{filename_prefix}_{video_basename}_logits.npy")
+
+        # saved_logits = torch.load(logits_path, map_location="cpu")
+        saved_logits = np.load(logits_path).astype(np.float32)
+
+        # 5) Aggregate across the n views
+        n = saved_logits.shape[1]
+        # tot_similarity = saved_logits.sum(dim=1) / n  # shape: (b, num_classes)
+        tot_similarity = np.sum(saved_logits, axis=1) / n
+
+        # tot_similarity_np = tot_similarity.numpy()
+        tot_similarity_np = tot_similarity
+
+
+        # Collect for final mAP
+        all_outputs.append(tot_similarity_np)
+        all_targets.append(label_id)
+
+        if idx % config.PRINT_FREQ == 0:
+            print(f"Processed {idx}/{len(val_loader)} videos")
+
+    # 8) Compute mAP across the entire set
+    all_outputs = np.vstack(all_outputs)  # shape: (num_videos, num_classes)
+    all_targets = np.vstack(all_targets)  # shape: (num_videos, num_classes)
+
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)
+    mean_mAP = np.mean(mAP_per_class)
+    print(f" * Mean Average Precision (mAP) from saved logits: {mean_mAP:.5f}")
+
+    return mean_mAP
+
+
+
+# @torch.no_grad()
+# def validate(val_loader, text_labels, model, config):
+#     import pdb
+#     pdb.set_trace()
+#     model.eval()
+    
+#     acc1_meter, acc5_meter = AverageMeter(), AverageMeter()
+#     with torch.no_grad():
+#         text_inputs = text_labels.cuda()
+#         logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+#         for idx, batch_data in enumerate(val_loader):
+#             _image = batch_data["imgs"]
+#             label_id = batch_data["label"]
+#             # print(label_id)
+#             label_id = label_id.reshape(-1)
+
+#             b, tn, c, h, w = _image.size()
+#             t = config.DATA.NUM_FRAMES
+#             n = tn // t
+#             _image = _image.view(b, n, t, c, h, w)
+           
+#             tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
+#             for i in range(n):
+#                 image = _image[:, i, :, :, :, :] # [b,t,c,h,w]
+#                 label_id = label_id.cuda(non_blocking=True)
+#                 image_input = image.cuda(non_blocking=True)
+
+#                 if config.TRAIN.OPT_LEVEL == 'O2':
+#                     image_input = image_input.half()
+                
+#                 output = model(image_input, text_inputs)
+                
+#                 similarity = output.view(b, -1).softmax(dim=-1)
+#                 tot_similarity += similarity
+
+#             values_1, indices_1 = tot_similarity.topk(1, dim=-1)
+#             values_5, indices_5 = tot_similarity.topk(5, dim=-1)
+#             acc1, acc5 = 0, 0
+#             for i in range(b):
+#                 if indices_1[i] == label_id[i]:
+#                     acc1 += 1
+#                 if label_id[i] in indices_5[i]:
+#                     acc5 += 1
+           
+#             acc1_meter.update(float(acc1) / b * 100, b)
+#             acc5_meter.update(float(acc5) / b * 100, b)
+#             if idx % config.PRINT_FREQ == 0:
+#                 logger.info(
+#                     f'Test: [{idx}/{len(val_loader)}]\t'
+#                     f'Acc@1: {acc1_meter.avg:.3f}\t'
+#                 )
+#     acc1_meter.sync()
+#     acc5_meter.sync()
+#     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+#     return acc1_meter.avg
 
 
 if __name__ == '__main__':
