@@ -24,6 +24,7 @@ from PIL import Image
 from .rand_augment import rand_augment_transform
 from torchvision import transforms
 from mmcv.fileio import FileClient
+from mmcv.parallel import DataContainer as DC
 
 PIPELINES = Registry('pipeline')
 
