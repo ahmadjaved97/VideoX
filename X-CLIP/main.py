@@ -20,6 +20,7 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from datasets.blending import CutmixMixupBlending
 from utils.config import get_config
 from models import xclip
+from sklearn.metrics import average_precision_score
 
 def parse_option():
     parser = argparse.ArgumentParser()
@@ -136,7 +137,8 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
     for idx, batch_data in enumerate(train_loader):
 
         images = batch_data["imgs"].cuda(non_blocking=True)
-        label_id = batch_data["label"].cuda(non_blocking=True)
+        label_id = batch_data["label"].cuda(non_blocking=True).float()
+        
         label_id = label_id.reshape(-1)
         images = images.view((-1,config.DATA.NUM_FRAMES,3)+images.size()[-2:])
         
@@ -186,19 +188,25 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
     epoch_time = time.time() - start
     logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
-
 @torch.no_grad()
 def validate(val_loader, text_labels, model, config):
     model.eval()
     
-    acc1_meter, acc5_meter = AverageMeter(), AverageMeter()
+    all_targets = []
+    all_outputs = []
+
+    # Initialize mAP tracker
+    mAP_meter = AverageMeter()
+    # import pdb
+    # pdb.set_trace()
+
     with torch.no_grad():
         text_inputs = text_labels.cuda()
         logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+        
         for idx, batch_data in enumerate(val_loader):
             _image = batch_data["imgs"]
-            label_id = batch_data["label"]
-            label_id = label_id.reshape(-1)
+            label_id = batch_data["label"].cuda(non_blocking=True).float()  # Already multi-hot formatted
 
             b, tn, c, h, w = _image.size()
             t = config.DATA.NUM_FRAMES
@@ -206,39 +214,98 @@ def validate(val_loader, text_labels, model, config):
             _image = _image.view(b, n, t, c, h, w)
            
             tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
-            for i in range(n):
-                image = _image[:, i, :, :, :, :] # [b,t,c,h,w]
-                label_id = label_id.cuda(non_blocking=True)
+            for i in range(n):  
+                image = _image[:, i, :, :, :, :]  # Extracting a temporal clip
                 image_input = image.cuda(non_blocking=True)
 
                 if config.TRAIN.OPT_LEVEL == 'O2':
                     image_input = image_input.half()
                 
                 output = model(image_input, text_inputs)
-                
-                similarity = output.view(b, -1).softmax(dim=-1)
+
+                # Apply sigmoid activation for multi-label classification
+                similarity = torch.sigmoid(output.view(b, -1)/10)
+
+                # Aggregate across different temporal clips
                 tot_similarity += similarity
 
-            values_1, indices_1 = tot_similarity.topk(1, dim=-1)
-            values_5, indices_5 = tot_similarity.topk(5, dim=-1)
-            acc1, acc5 = 0, 0
-            for i in range(b):
-                if indices_1[i] == label_id[i]:
-                    acc1 += 1
-                if label_id[i] in indices_5[i]:
-                    acc5 += 1
-           
-            acc1_meter.update(float(acc1) / b * 100, b)
-            acc5_meter.update(float(acc5) / b * 100, b)
+            tot_similarity = tot_similarity / n
+            # Store outputs and ground truth for mAP computation
+            all_outputs.append(tot_similarity.cpu().numpy())
+            all_targets.append(label_id.cpu().numpy())  # Already multi-hot
+
             if idx % config.PRINT_FREQ == 0:
-                logger.info(
-                    f'Test: [{idx}/{len(val_loader)}]\t'
-                    f'Acc@1: {acc1_meter.avg:.3f}\t'
-                )
-    acc1_meter.sync()
-    acc5_meter.sync()
-    logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
-    return acc1_meter.avg
+                logger.info(f'Processed {idx}/{len(val_loader)} batches')
+
+    # Compute mean Average Precision (mAP)
+    all_outputs = np.vstack(all_outputs)
+    all_targets = np.vstack(all_targets)
+    
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)  # Per-class AP
+    mean_mAP = np.mean(mAP_per_class)  # Mean AP across all classes
+
+    # Sync mAP across all GPUs
+    mAP_meter.update(mean_mAP, n=1)
+    mAP_meter.sync()
+
+    logger.info(f" * Mean Average Precision (mAP): {mAP_meter.avg:.3f}")
+    return mAP_meter.avg
+
+# @torch.no_grad()
+# def validate(val_loader, text_labels, model, config):
+#     import pdb
+#     pdb.set_trace()
+#     model.eval()
+    
+#     acc1_meter, acc5_meter = AverageMeter(), AverageMeter()
+#     with torch.no_grad():
+#         text_inputs = text_labels.cuda()
+#         logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+#         for idx, batch_data in enumerate(val_loader):
+#             _image = batch_data["imgs"]
+#             label_id = batch_data["label"]
+#             # print(label_id)
+#             label_id = label_id.reshape(-1)
+
+#             b, tn, c, h, w = _image.size()
+#             t = config.DATA.NUM_FRAMES
+#             n = tn // t
+#             _image = _image.view(b, n, t, c, h, w)
+           
+#             tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
+#             for i in range(n):
+#                 image = _image[:, i, :, :, :, :] # [b,t,c,h,w]
+#                 label_id = label_id.cuda(non_blocking=True)
+#                 image_input = image.cuda(non_blocking=True)
+
+#                 if config.TRAIN.OPT_LEVEL == 'O2':
+#                     image_input = image_input.half()
+                
+#                 output = model(image_input, text_inputs)
+                
+#                 similarity = output.view(b, -1).softmax(dim=-1)
+#                 tot_similarity += similarity
+
+#             values_1, indices_1 = tot_similarity.topk(1, dim=-1)
+#             values_5, indices_5 = tot_similarity.topk(5, dim=-1)
+#             acc1, acc5 = 0, 0
+#             for i in range(b):
+#                 if indices_1[i] == label_id[i]:
+#                     acc1 += 1
+#                 if label_id[i] in indices_5[i]:
+#                     acc5 += 1
+           
+#             acc1_meter.update(float(acc1) / b * 100, b)
+#             acc5_meter.update(float(acc5) / b * 100, b)
+#             if idx % config.PRINT_FREQ == 0:
+#                 logger.info(
+#                     f'Test: [{idx}/{len(val_loader)}]\t'
+#                     f'Acc@1: {acc1_meter.avg:.3f}\t'
+#                 )
+#     acc1_meter.sync()
+#     acc5_meter.sync()
+#     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
+#     return acc1_meter.avg
 
 
 if __name__ == '__main__':

@@ -184,6 +184,8 @@ class VideoDataset(BaseDataset):
         return classes_all.values.tolist()
 
     def load_annotations(self):
+        # import pdb
+        # pdb.set_trace()
         """Load annotation file to get video information."""
         if self.ann_file.endswith('.json'):
             return self.load_json_annotations()
@@ -191,14 +193,17 @@ class VideoDataset(BaseDataset):
         video_infos = []
         with open(self.ann_file, 'r') as fin:
             for line in fin:
-                line_split = line.strip().split()
+                line_split = line.strip().split(',')
                 if self.multi_class:
                     assert self.num_classes is not None
-                    filename, label = line_split[0], line_split[1:]
+                    filename, label = line_split[0], line_split[1]
+                    label = label.split("|")
                     label = list(map(int, label))
                 else:
                     filename, label = line_split
+                    print(filename, label)
                     label = int(label)
+                    
                 if self.data_prefix is not None:
                     filename = osp.join(self.data_prefix, filename)
                 video_infos.append(dict(filename=filename, label=label, tar=self.use_tar_format))
@@ -242,6 +247,8 @@ def mmcv_collate(batch, samples_per_gpu=1):
 
 
 def build_dataloader(logger, config):
+    # import pdb
+    # pdb.set_trace()
     scale_resize = int(256 / 224 * config.DATA.INPUT_SIZE)
 
     train_pipeline = [
@@ -267,7 +274,7 @@ def build_dataloader(logger, config):
         
     
     train_data = VideoDataset(ann_file=config.DATA.TRAIN_FILE, data_prefix=config.DATA.ROOT,
-                              labels_file=config.DATA.LABEL_LIST, pipeline=train_pipeline)
+                              labels_file=config.DATA.LABEL_LIST, pipeline=train_pipeline, multi_class=True, num_classes=config.DATA.NUM_CLASSES)
     num_tasks = dist.get_world_size()
     global_rank = dist.get_rank()
     sampler_train = torch.utils.data.DistributedSampler(
@@ -299,7 +306,10 @@ def build_dataloader(logger, config):
     if config.TEST.NUM_CLIP > 1:
         val_pipeline[1] = dict(type='SampleFrames', clip_len=1, frame_interval=1, num_clips=config.DATA.NUM_FRAMES, multiview=config.TEST.NUM_CLIP)
     
-    val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=config.DATA.ROOT, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline)
+    # import pdb
+    # pdb.set_trace()
+    val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=config.DATA.ROOT, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline,
+                            multi_class=True, num_classes=config.DATA.NUM_CLASSES)
     indices = np.arange(dist.get_rank(), len(val_data), dist.get_world_size())
     sampler_val = SubsetRandomSampler(indices)
     val_loader = DataLoader(
