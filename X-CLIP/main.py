@@ -20,6 +20,7 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from datasets.blending import CutmixMixupBlending
 from utils.config import get_config
 from models import xclip
+from sklearn.metrics import average_precision_score
 
 def parse_option():
     parser = argparse.ArgumentParser()
@@ -95,8 +96,13 @@ def main(config):
     text_labels = generate_text(train_data)
     
     if config.TEST.ONLY_TEST:
-        acc1 = validate(val_loader, text_labels, model, config)
-        logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+        if config.TEST.MULTI_LABEL:
+            mAP = validate_multilabel(val_loader, text_labels, model, config)
+            logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {mAP:.5f}")
+        else:
+            acc1 = validate(val_loader, text_labels, model, config)
+            logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+        
         return
 
     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
@@ -240,6 +246,74 @@ def validate(val_loader, text_labels, model, config):
     logger.info(f' * Acc@1 {acc1_meter.avg:.3f} Acc@5 {acc5_meter.avg:.3f}')
     return acc1_meter.avg
 
+
+@torch.no_grad()
+def validate_multilabel(val_loader, text_labels, model, config):
+    model.eval()
+    
+    all_targets = []
+    all_outputs = []
+
+    # Initialize mAP tracker
+    mAP_meter = AverageMeter()
+
+    with torch.no_grad():
+        text_inputs = text_labels.cuda()
+        logger.info(f"{config.TEST.NUM_CLIP * config.TEST.NUM_CROP} views inference")
+        
+        for idx, batch_data in enumerate(val_loader):
+            _image = batch_data["imgs"]
+            label_id = batch_data["label"].cuda(non_blocking=True).float()  # Already multi-hot formatted
+
+            b, tn, c, h, w = _image.size()
+            t = config.DATA.NUM_FRAMES
+            n = tn // t
+            _image = _image.view(b, n, t, c, h, w)
+           
+            tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
+            for i in range(n):  
+                image = _image[:, i, :, :, :, :] 
+                image_input = image.cuda(non_blocking=True)
+
+                if config.TRAIN.OPT_LEVEL == 'O2':
+                    image_input = image_input.half()
+                
+                output = model(image_input, text_inputs)
+                mean = output.mean(dim=1, keepdim=True)
+                std = output.std(dim=1, keepdim=True) + 1e-6  # Prevent divide by zero
+                standardized_logits = (output - mean) / std
+
+                # Apply sigmoid activation 
+                # similarity = torch.sigmoid(output.view(b, -1))
+                # similarity = output.view(b, -1)
+
+                similarity = torch.sigmoid(standardized_logits.view(b, -1))
+
+
+                # Aggregate across different temporal clips
+                tot_similarity += similarity
+
+            tot_similarity = tot_similarity / n
+            # Store outputs and ground truth 
+            all_outputs.append(tot_similarity.cpu().numpy())
+            all_targets.append(label_id.cpu().numpy())  # Already multi-hot
+
+            if idx % config.PRINT_FREQ == 0:
+                logger.info(f'Processed {idx}/{len(val_loader)} batches')
+
+    #mean Average Precision
+    all_outputs = np.vstack(all_outputs)
+    all_targets = np.vstack(all_targets)
+    
+    mAP_per_class = average_precision_score(all_targets, all_outputs, average=None)  
+    mean_mAP = np.mean(mAP_per_class)  
+
+    # Sync mAP across all GPUs
+    mAP_meter.update(mean_mAP, n=1)
+    mAP_meter.sync()
+
+    logger.info(f" * Mean Average Precision (mAP): {mAP_meter.avg:.5f}")
+    return mAP_meter.avg
 
 if __name__ == '__main__':
     # prepare config

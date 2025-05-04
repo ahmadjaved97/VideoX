@@ -194,7 +194,8 @@ class VideoDataset(BaseDataset):
                 line_split = line.strip().split()
                 if self.multi_class:
                     assert self.num_classes is not None
-                    filename, label = line_split[0], line_split[1:]
+                    filename, label = line_split[0], line_split[1]
+                    label = label.split("|")
                     label = list(map(int, label))
                 else:
                     filename, label = line_split

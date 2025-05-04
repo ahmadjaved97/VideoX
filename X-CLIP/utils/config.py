@@ -64,6 +64,7 @@ _C.TEST = CN()
 _C.TEST.NUM_CLIP = 1
 _C.TEST.NUM_CROP = 1
 _C.TEST.ONLY_TEST = False
+_C.TEST.MULTI_LABEL = False
 
 # -----------------------------------------------------------------------------
 # Misc
