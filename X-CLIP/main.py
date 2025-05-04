@@ -268,7 +268,7 @@ def validate_multilabel(val_loader, text_labels, model, config):
             b, tn, c, h, w = _image.size()
             t = config.DATA.NUM_FRAMES
             n = tn // t
-            _image = _image.view(b, n, t, c, h, w)
+            _image = _image.view(b, n, t, c, h, w) # batch, views (clipxcrops), frames, ...
            
             tot_similarity = torch.zeros((b, config.DATA.NUM_CLASSES)).cuda()
             for i in range(n):  
@@ -278,7 +278,9 @@ def validate_multilabel(val_loader, text_labels, model, config):
                 if config.TRAIN.OPT_LEVEL == 'O2':
                     image_input = image_input.half()
                 
+                
                 output = model(image_input, text_inputs)
+                
                 mean = output.mean(dim=1, keepdim=True)
                 std = output.std(dim=1, keepdim=True) + 1e-6  # Prevent divide by zero
                 standardized_logits = (output - mean) / std
