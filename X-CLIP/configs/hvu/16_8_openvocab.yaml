@@ -1,0 +1,13 @@
+DATA:
+    ROOT: '/ssd4/datasets/HVU_Dataset'
+    TRAIN_FILE: '/ssd4/ajaved/evaluation_repos/open_vocab/category_files/open_vocab_object_val.txt'
+    VAL_FILE: '/ssd4/ajaved/evaluation_repos/open_vocab/category_files/open_vocab_object_val.txt'
+    DATASET: HVU
+    NUM_FRAMES: 32
+    NUM_CLASSES: 1670
+    LABEL_LIST: '/ssd4/ajaved/evaluation_repos/open_vocab/label_files/open_vocab_object_labels.csv'
+MODEL:
+    ARCH: ViT-B/16
+TRAIN:
+    BATCH_SIZE: 32
+    ACCUMULATION_STEPS: 4
