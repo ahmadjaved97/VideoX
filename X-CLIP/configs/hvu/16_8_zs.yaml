@@ -1,0 +1,15 @@
+DATA:
+    ROOT: '/ssd4/datasets/HVU_Dataset'
+    TRAIN_FILE: '/ssd4/ajaved/evaluation_repos/zeroshot_evaluation/category_files/zeroshot_attribute_val.csv'
+    VAL_FILE: '/ssd4/ajaved/evaluation_repos/zeroshot_evaluation/category_files/zeroshot_attribute_val.csv'
+    DATASET: HVU
+    NUM_FRAMES: 32
+    NUM_CLASSES: 113
+    LABEL_LIST: '/ssd4/ajaved/evaluation_repos/zeroshot_evaluation/label_files/zeroshot_attribute_labels.csv'
+MODEL:
+    ARCH: ViT-B/16
+TRAIN:
+    BATCH_SIZE: 32
+    ACCUMULATION_STEPS: 4
+TEST:
+    MULTI_LABEL: True
